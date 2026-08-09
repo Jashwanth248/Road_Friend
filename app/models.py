@@ -20,12 +20,22 @@ class ToolResult(BaseModel):
     data: Any
 
 
+class PermissionRequest(BaseModel):
+    id: str
+    capability: str
+    title: str
+    reason: str
+    scope: Literal["once", "session"] = "once"
+
+
 class ChatResponse(BaseModel):
     text: str
     intent: str
-    tools: list[ToolResult] = []
+    tools: list[ToolResult] = Field(default_factory=list)
     speak: bool = True
     safety_notice: str | None = None
+    permission_request: PermissionRequest | None = None
+    ui_action: str | None = None
 
 
 class PlaceSearchRequest(BaseModel):

@@ -7,3 +7,9 @@ artifacts/
 data/private/
 *.joblib
 .DS_Store
+
+# Personal OAuth credentials/tokens: never commit
+credentials.json
+token.json
+client_secret*.json
+*.oauth.json
