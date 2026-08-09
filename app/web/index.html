@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>RoadMate AI</title>
+<style>
+body{font-family:system-ui;margin:0;background:#0b1020;color:#eef3ff}.wrap{max-width:900px;margin:auto;padding:24px}.card{background:#151c33;border:1px solid #293353;border-radius:18px;padding:20px}.row{display:flex;gap:10px}.chat{height:420px;overflow:auto;background:#0e1528;border-radius:14px;padding:14px;margin:16px 0}.m{margin:10px 0;padding:10px 12px;border-radius:12px;background:#1d2847}.u{background:#243b6b}input{flex:1;padding:14px;border-radius:12px;border:0}button{padding:12px 16px;border-radius:12px;border:0;cursor:pointer}.status{opacity:.8;font-size:14px}.badge{display:inline-block;padding:5px 9px;border:1px solid #47577f;border-radius:99px;margin-right:6px}
+</style>
+</head>
+<body><div class="wrap"><h1>RoadMate AI</h1><p>Voice + text multimodal mobility assistant</p><div><span class="badge">Places</span><span class="badge">Routes</span><span class="badge">Music</span><span class="badge">RAG</span><span class="badge">ML</span></div><div class="card"><div id="status" class="status">Connecting…</div><div id="chat" class="chat"></div><div class="row"><input id="msg" placeholder="Ask: find waterfalls near me"/><button onclick="sendText()">Send</button><button onclick="listen()">🎤 Talk</button></div><p class="status">Voice recognition/speech uses your browser. Road-awareness features are advisory only and do not make driving decisions.</p></div></div>
+<script>
+let ws; let coords=null;
+navigator.geolocation?.getCurrentPosition(p=>coords={latitude:p.coords.latitude,longitude:p.coords.longitude});
+function connect(){ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/assistant`);ws.onopen=()=>status.textContent='Connected';ws.onmessage=e=>{const r=JSON.parse(e.data);add(r.text,'a');if(r.speak) speak(r.text);};ws.onclose=()=>setTimeout(connect,1000)}
+function add(t,c){const d=document.createElement('div');d.className='m '+(c==='u'?'u':'');d.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight}
+function sendText(){const t=msg.value.trim();if(!t)return;add(t,'u');ws.send(JSON.stringify({message:t,location:coords,session_id:'browser'}));msg.value=''}
+function speak(t){if('speechSynthesis'in window){speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(t))}}
+function listen(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){add('Speech recognition is not supported in this browser.','a');return}const r=new SR();r.lang='en-US';r.interimResults=false;r.onstart=()=>status.textContent='Listening…';r.onresult=e=>{msg.value=e.results[0][0].transcript;sendText()};r.onend=()=>status.textContent='Connected';r.start()}
+connect();
+</script></body></html>
