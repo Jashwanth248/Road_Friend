@@ -1,185 +1,153 @@
 # Road Friend — Personal AI Companion
 
-Road Friend is a local-first, voice + text personal AI companion. It combines current web answers, Google Maps location intelligence, traffic-aware routing, selected-file document understanding, Gmail, Spotify, optional macOS Messages, RAG, ML, data engineering, and cloud-ready integrations behind one conversational interface.
+Road Friend is a local-first voice + text personal companion for your Mac. It can search the public web, summarize results conversationally, use your live location, open Google/Google Maps/YouTube/Prime Video with permission, read files you explicitly choose, connect to Gmail, and use optional local AI through Ollama.
 
-The design goal is simple: **talk naturally, let the agent choose the right tool, and require permission before private access or external actions.**
+## How it behaves
 
-## What it can do
+You can talk naturally:
 
-- Talk with you by voice or text.
-- Run in **Hands Free** mode: listen → answer → speak → listen again.
-- Answer open-ended questions with Gemini.
-- Ground current-information questions with Google Search.
-- Ask for browser location permission and find real nearby places.
-- Remember the places it just listed so “take me to the first one” works.
-- Calculate traffic-aware driving routes with Google Routes.
-- Read only the local PDF/Word/Excel/PowerPoint/CSV/text files you explicitly choose.
-- Use RAG to answer follow-up questions from those documents.
-- Connect Gmail with Google OAuth, summarize recent messages, and search mail.
-- Require a separate confirmation before every outgoing email.
-- Search/control Spotify when OAuth/token configuration is available.
-- Optionally send a macOS Messages/iMessage message after a one-time confirmation.
-- Record structured interaction events for later analytics/ML work.
+```text
+You: What's happening with Nvidia today?
+Road Friend: I checked the web. The main things I'm seeing are ...
 
-## Permission model
+You: Find coffee near me.
+Road Friend: [uses structured Google Places if configured; otherwise asks to open Google Maps at your location]
 
-Road Friend does **not** crawl your Mac, inbox, camera, or accounts automatically.
+You: Play Interstellar trailer on YouTube.
+Road Friend: I can open YouTube and search for that. Want me to open it?
+You: Yes.
+Road Friend: Opening YouTube.
 
-| Capability | Behavior |
-|---|---|
-| Location | Browser asks permission; coordinates are shared only while enabled |
-| Local files | Road Friend asks first, then opens the browser file picker; only selected files are read |
-| Gmail read | Road Friend asks permission for the session, then Google OAuth controls account authorization |
-| Email send | Confirmation required for every send |
-| macOS Messages send | Confirmation required for every send; integration is off by default |
-| Camera | Not enabled by default |
-| Driving perception | Advisory only; never an authoritative go/stop controller |
-
-See [`docs/PERMISSIONS.md`](docs/PERMISSIONS.md).
-
-## Architecture
-
-```mermaid
-flowchart LR
-  U[Voice / Text User] --> UI[Browser Companion UI]
-  UI --> API[FastAPI + WebSocket]
-  API --> O[Road Friend Orchestrator]
-
-  O --> G[Gemini + Google Search]
-  O --> P[Google Places]
-  O --> R[Google Routes]
-  O --> F[Permissioned Local Files + RAG]
-  O --> M[Gmail OAuth]
-  O --> S[Spotify]
-  O --> MSG[Optional macOS Messages]
-
-  UI --> LOC[Browser Geolocation]
-  LOC --> O
-
-  API --> E[Structured Events]
-  E --> BQ[Pub/Sub / BigQuery Design]
+You: Find The Boys on Prime.
+Road Friend: Want me to open Prime Video and search for it?
 ```
 
-## Run locally on Mac
+External browser actions require approval. Private data access requires permission. Sending email or Messages requires a separate confirmation.
+
+## No Google Cloud required for normal questions
+
+Normal public-web questions use a key-free web-search backend. Google Cloud is not required for that.
+
+For natural AI summarization you have two choices:
+
+### Option A — fully local conversation with Ollama
+
+Install Ollama on your Mac, then run a local model such as Llama:
+
+```bash
+ollama pull llama3.2
+ollama serve
+```
+
+Add to `.env`:
+
+```text
+OLLAMA_MODEL=llama3.2
+```
+
+Road Friend will search the web and give the search results to the local model to produce a natural spoken summary.
+
+### Option B — Gemini API
+
+You can still use Gemini if you want:
+
+```text
+GEMINI_API_KEY=...
+```
+
+Gemini is optional.
+
+## Google Maps behavior
+
+Two modes are supported:
+
+1. **No Maps API key:** Road Friend asks permission and opens real Google Maps in your browser using your query/location.
+2. **Maps API key configured:** Road Friend can directly read structured place names, ratings, review counts, coordinates, routes and traffic-aware ETAs.
+
+Optional:
+
+```text
+GOOGLE_MAPS_API_KEY=...
+```
+
+## Browser tools
+
+Road Friend can prepare and open, after approval:
+
+- Google Search
+- Google Maps
+- YouTube search
+- Prime Video search
+
+Examples:
+
+```text
+search Google for latest AI news
+open Google Maps for sushi near me
+play Telugu songs on YouTube
+open Oppenheimer on Prime Video
+```
+
+Road Friend opens normal browser pages. It does not bypass logins, subscriptions, DRM, or paywalls. If YouTube/Prime requires your account, you use your normal signed-in browser session.
+
+## Local files
+
+Road Friend never crawls your Mac. When you ask it to read a document, it asks permission and opens a file picker. Only the file you select is sent to the local Road Friend process.
+
+Supported types include PDF, DOCX, XLSX, PPTX, CSV, text, Markdown and JSON.
+
+## Run on Mac
 
 ```bash
 git clone https://github.com/Jashwanth248/Road_Friend.git
 cd Road_Friend
-
 python3 -m venv .venv
 source .venv/bin/activate
-
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8080
 ```
 
-Open:
+Open Chrome:
 
 ```text
 http://localhost:8080
 ```
 
-For the best current browser speech-recognition support on macOS, use current Chrome.
+Then use **Talk** or **Hands Free**.
 
-## Configure live AI + Maps
+## Optional `.env`
 
-Create a local `.env`:
-
-```text
-GEMINI_API_KEY=your_key
-GOOGLE_MAPS_API_KEY=your_key
-GEMINI_MODEL=gemini-3.6-flash
-```
-
-Enable in Google Cloud:
-
-- Places API (New)
-- Routes API
-
-Never commit `.env` or credentials.
-
-## Connect Gmail
-
-1. Enable the Gmail API in a Google Cloud project.
-2. Configure the Google OAuth consent screen.
-3. Create an **OAuth Desktop app** client.
-4. Download the OAuth client JSON.
-5. Save it locally in the repo as `credentials.json`.
-6. Start Road Friend.
-7. Click **Connect Gmail**, or say “check my Gmail” and approve the permission request.
-8. Google opens an OAuth consent flow in your browser.
-9. A local `token.json` is created after authorization.
-
-Both `credentials.json` and `token.json` are ignored by Git.
-
-## Example conversation
+Road Friend can start without Google API keys. Example:
 
 ```text
-You: Hey Road Friend, what happened in AI news today?
-Road Friend: [Gemini + Google Search grounded spoken answer]
+# Best local/no-cloud conversational mode
+OLLAMA_MODEL=llama3.2
+OLLAMA_BASE_URL=http://127.0.0.1:11434
 
-You: Find a quiet coffee place near me.
-Road Friend: I need your location. Would you like to enable location?
-[Enable Location]
+# Optional cloud AI
+# GEMINI_API_KEY=...
 
-You: Find the best coffee near me.
-Road Friend: 1... 2... 3...
+# Optional structured Maps ratings/routes/traffic
+# GOOGLE_MAPS_API_KEY=...
 
-You: Take me to the second one.
-Road Friend: The traffic-aware route is ...
-
-You: Read my resume.
-Road Friend: May I open a file picker so you can choose the document?
-You: Yes.
-[file picker opens]
-
-You: What experience in that resume is most relevant to an AI engineer role?
-Road Friend: [RAG answer from the selected resume]
-
-You: Check my latest emails.
-Road Friend: May I access Gmail for this session?
-You: Yes.
-[OAuth if needed]
-Road Friend: [summarizes recent mail]
-
-You: Send an email to person@example.com saying I will call tomorrow.
-Road Friend: I prepared the email. Should I send it?
-You: Yes.
-Road Friend: Sent.
+# Optional macOS Messages sending
+ALLOW_MACOS_MESSAGES=false
 ```
 
-## Main APIs
+## Permission model
 
-- `POST /v1/chat`
-- `WS /ws/assistant`
-- `POST /v1/route`
-- `POST /v1/files/ingest`
-- `POST /v1/rag/query`
-- `POST /v1/integrations/gmail/connect`
-- `GET /v1/integrations/gmail/status`
-- `GET /v1/capabilities`
-- `GET /metrics`
-- `GET /healthz`
+| Capability | Rule |
+|---|---|
+| Public web search | Allowed |
+| Open Google/Maps/YouTube/Prime | Ask before opening |
+| Location | Browser permission |
+| Local files | Ask + user file picker |
+| Gmail reading | Ask + OAuth |
+| Gmail sending | Confirm every send |
+| macOS Messages | Confirm every send |
+| Camera | Off by default |
+| Driving perception | Advisory only |
 
-## Current limits
+## Important limits
 
-- Voice uses browser speech recognition + browser text-to-speech. It supports hands-free turn taking, but native Gemini Live audio streaming is a separate next step.
-- Gmail requires your own OAuth Desktop credentials.
-- Reading arbitrary local files without a picker is intentionally not supported.
-- macOS Messages sending is optional and disabled by default.
-- iMessage/SMS reading is not enabled because macOS protects the Messages database and unrestricted access would require broader OS permissions.
-- Road-sign/signal AI remains advisory only and must not make driving decisions.
-
-## Next production upgrades
-
-- Native Gemini Live bidirectional audio/video streaming
-- Google Calendar + Contacts OAuth tools
-- real Spotify OAuth account linking
-- map visualization and route polyline UI
-- Android/Flutter mobile client with Navigation SDK
-- Vertex AI Vector Search / pgvector document memory
-- encrypted long-term user preference memory
-- OpenTelemetry traces for model/tool calls
-- Pub/Sub → Dataflow → BigQuery event pipeline
-- trained XGBoost place recommender
-- optional YOLO/TFLite road-awareness model
+Road Friend can open YouTube or Prime Video searches in your browser, but it does not bypass account authentication or streaming protections. Directly scraping Google Search/Google Maps pages in the background is intentionally avoided because it is brittle; structured Maps details require the official Maps API, while normal web answers use the independent key-free search backend.

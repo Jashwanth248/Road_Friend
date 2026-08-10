@@ -5,10 +5,14 @@ class Settings(BaseSettings):
     app_name: str = "Road Friend"
     environment: str = "local"
 
-    # Public information / AI
-    google_maps_api_key: str | None = None
+    # Optional AI providers
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.6-flash"
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_model: str | None = None
+
+    # Maps (optional; browser Maps fallback works without this)
+    google_maps_api_key: str | None = None
 
     # Personal integrations
     spotify_access_token: str | None = None

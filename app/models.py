@@ -36,6 +36,7 @@ class ChatResponse(BaseModel):
     safety_notice: str | None = None
     permission_request: PermissionRequest | None = None
     ui_action: str | None = None
+    ui_data: dict[str, Any] = Field(default_factory=dict)
 
 
 class PlaceSearchRequest(BaseModel):

@@ -6,23 +6,25 @@ from typing import Any
 import httpx
 
 from app.data.events import EventSink
+from app.integrations.browser_actions import BrowserActions
 from app.integrations.gemini import GeminiConfigurationError, GeminiFriend
 from app.integrations.gmail import GmailClient, GmailConfigurationError
+from app.integrations.local_ai import LocalAI
 from app.integrations.macos_messages import MacMessagesClient
 from app.integrations.places import PlacesClient, PlacesConfigurationError
 from app.integrations.routes import RoutesClient
 from app.integrations.spotify import SpotifyClient
+from app.integrations.web_search import WebSearchClient
 from app.ml.recommender import rank_places
 from app.models import ChatRequest, ChatResponse, Location, PermissionRequest, ToolResult
 from app.permissions import PermissionBroker
-
 
 YES = {"yes", "yep", "yeah", "allow", "okay", "ok", "go ahead", "sure", "do it"}
 NO = {"no", "nope", "deny", "cancel", "don't", "do not"}
 
 
 class RoadMateOrchestrator:
-    """Personal companion orchestrator with private-data permissions and conversational memory."""
+    """Personal companion orchestrator with search, browser actions, memory and permissions."""
 
     def __init__(self, rag=None) -> None:
         self.places = PlacesClient()
@@ -31,16 +33,16 @@ class RoadMateOrchestrator:
         self.gmail = GmailClient()
         self.messages = MacMessagesClient()
         self.gemini = GeminiFriend()
+        self.local_ai = LocalAI()
+        self.web = WebSearchClient()
+        self.browser = BrowserActions()
         self.events = EventSink()
         self.permissions = PermissionBroker()
         self.rag = rag
         self.sessions: dict[str, dict[str, Any]] = {}
 
     def _session(self, session_id: str) -> dict[str, Any]:
-        return self.sessions.setdefault(
-            session_id,
-            {"places": [], "selected_place": None, "location": None, "history": [], "documents": []},
-        )
+        return self.sessions.setdefault(session_id, {"places": [], "selected_place": None, "location": None, "history": [], "documents": []})
 
     def register_document(self, session_id: str, filename: str) -> None:
         state = self._session(session_id)
@@ -60,103 +62,153 @@ class RoadMateOrchestrator:
         pending = self.permissions.pending(req.session_id)
         if pending and lower in YES:
             self.permissions.consume(req.session_id)
-            return await self._execute_permission(req.session_id, pending, location, state)
+            return self._remember(state, text, await self._execute_permission(req.session_id, pending, location, state))
         if pending and lower in NO:
             self.permissions.deny(req.session_id)
-            return ChatResponse(text="Okay, I won't access or perform that action.", intent="permission_denied")
+            return self._remember(state, text, ChatResponse(text="Okay, I won't do that.", intent="permission_denied"))
+
+        media = self._parse_browser_request(text)
+        if media:
+            pending = self.permissions.request(req.session_id, "browser_open", f"Open {media['label']} in your browser for: {media['query']}", "browser_open", media)
+            return self._remember(state, text, ChatResponse(
+                text=f"Sure. I can open {media['label']} and search for “{media['query']}”. Want me to open it?",
+                intent="permission",
+                permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title=f"Open {media['label']}?", reason=pending.reason, scope="once"),
+            ))
 
         selected = self._resolve_place_reference(text, state.get("places", []))
         route_requested = any(k in lower for k in ["take me", "route me", "directions", "navigate", "get me there", "go there"])
         if selected and (route_requested or self._looks_like_selection(lower)):
             state["selected_place"] = selected
             if not route_requested:
-                return self._remember(state, text, ChatResponse(text=f"Selected {selected['name']}. Say 'take me there' and I'll calculate a live route from your current location.", intent="place_selection", tools=[ToolResult(tool="selected_place", data=selected)]))
+                return self._remember(state, text, ChatResponse(text=f"Got it — {selected['name']}. Say ‘take me there’ and I’ll work out the route.", intent="place_selection", tools=[ToolResult(tool="selected_place", data=selected)]))
             return self._remember(state, text, await self._route_to_place(selected, location))
-
         if route_requested and state.get("selected_place"):
             return self._remember(state, text, await self._route_to_place(state["selected_place"], location))
 
         if self._is_place_search(lower):
-            return self._remember(state, text, await self._handle_place_search(text, location, state))
+            return self._remember(state, text, await self._handle_place_search(text, location, state, req.session_id))
 
         if self._looks_like_file_request(lower):
             if state["documents"] and self._looks_like_document_question(lower):
                 return self._remember(state, text, await self._answer_from_documents(text, state))
-            pending = self.permissions.request(req.session_id, "files_read", "Open a file picker so you can choose exactly which local document Road Friend may read.", "choose_file")
-            return self._remember(state, text, ChatResponse(text="I can read it, but I won't browse your Mac automatically. May I open a file picker so you can choose the document?", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Allow document selection?", reason=pending.reason, scope="once")))
+            pending = self.permissions.request(req.session_id, "files_read", "Open a file picker so you choose exactly which local document Road Friend may read.", "choose_file")
+            return self._remember(state, text, ChatResponse(text="I can read it. I won't browse your Mac by myself — may I open a file picker so you can choose the document?", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Choose a document?", reason=pending.reason, scope="once")))
 
         if self._looks_like_gmail_read(lower):
             if not self.permissions.has(req.session_id, "gmail_read"):
                 pending = self.permissions.request(req.session_id, "gmail_read", "Read Gmail metadata and snippets for this Road Friend session.", "gmail_read")
-                return self._remember(state, text, ChatResponse(text="I can check your Gmail. May I access your Gmail for this session? Google OAuth will ask you to sign in if it isn't connected yet.", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Allow Gmail read access?", reason=pending.reason, scope="session")))
+                return self._remember(state, text, ChatResponse(text="I can check your Gmail. May I access it for this session?", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Allow Gmail access?", reason=pending.reason, scope="session")))
             return self._remember(state, text, await self._read_gmail(text))
 
         draft = self._parse_email_send(text)
         if draft:
             pending = self.permissions.request(req.session_id, "gmail_send", f"Send one email to {draft['to']}.", "gmail_send", draft)
-            return self._remember(state, text, ChatResponse(text=f"I can send that email to {draft['to']}. Subject: {draft['subject']}. Message: {draft['body']}. Should I send it?", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Send this email?", reason=pending.reason, scope="once")))
+            return self._remember(state, text, ChatResponse(text=f"I prepared the email to {draft['to']}: “{draft['body']}”. Should I send it?", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Send this email?", reason=pending.reason, scope="once")))
 
         sms = self._parse_text_send(text)
         if sms:
-            pending = self.permissions.request(req.session_id, "messages_send", f"Send one message to {sms['recipient']} through the local macOS Messages app.", "messages_send", sms)
-            return self._remember(state, text, ChatResponse(text=f"I prepared this message for {sms['recipient']}: {sms['body']}. Should I send it through Messages?", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Send this message?", reason=pending.reason, scope="once")))
+            pending = self.permissions.request(req.session_id, "messages_send", f"Send one message to {sms['recipient']} through macOS Messages.", "messages_send", sms)
+            return self._remember(state, text, ChatResponse(text=f"I prepared this message for {sms['recipient']}: “{sms['body']}”. Should I send it?", intent="permission", permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Send this message?", reason=pending.reason, scope="once")))
 
         if lower.startswith("pause") or "pause music" in lower:
             result = await self.spotify.pause()
-            return self._remember(state, text, ChatResponse(text="I sent the pause command to Spotify." if result.get("mode") == "live" else result["message"], intent="music", tools=[ToolResult(tool="spotify", data=result)]))
-
-        if any(k in lower for k in ["play ", "song", "music"]):
-            query = re.sub(r"^(please )?play\s+", "", text, flags=re.I)
-            result = await self.spotify.search_track(query)
-            return self._remember(state, text, ChatResponse(text="I searched Spotify for that request." if result.get("mode") == "live" else result["message"], intent="music", tools=[ToolResult(tool="spotify", data=result)]))
+            return self._remember(state, text, ChatResponse(text="Done — I sent pause to Spotify." if result.get("mode") == "live" else result["message"], intent="music", tools=[ToolResult(tool="spotify", data=result)]))
 
         if any(k in lower for k in ["red light", "green light", "traffic signal", "stop sign"]):
-            return self._remember(state, text, ChatResponse(text="I can explain detected road signs or signal observations, but I cannot make driving decisions for you. Follow the physical signal, road signs, and applicable law.", intent="road_awareness", safety_notice="Road-awareness output is advisory only and must not be used as an authoritative go/stop command."))
+            return self._remember(state, text, ChatResponse(text="I can explain what a sign or signal means, but I won't make the driving decision for you. Follow the real signal, signs, road conditions and law.", intent="road_awareness", safety_notice="Road-awareness output is advisory only."))
 
         if lower in {"hi", "hello", "hey", "hey roadmate", "hey road friend"}:
-            return self._remember(state, text, ChatResponse(text="Hi! I'm Road Friend. Talk to me naturally. I can answer questions, search current information with Google, find places, route you, read documents you choose, check Gmail with permission, control music, and prepare messages.", intent="greeting"))
+            return self._remember(state, text, ChatResponse(text="Hey! I’m here. Ask me anything, ask me to search the web, find somewhere nearby, open YouTube or Prime, read a file you choose, or help with Gmail.", intent="greeting"))
 
         return self._remember(state, text, await self._general_answer(text, state, location))
 
     async def _execute_permission(self, session_id: str, pending, location: Location | None, state: dict[str, Any]) -> ChatResponse:
+        if pending.capability == "browser_open":
+            return ChatResponse(text=f"Opening {pending.payload['label']} for you.", intent="browser_open", ui_action="open_url", ui_data={"url": pending.payload["url"], "label": pending.payload["label"]})
         if pending.capability == "files_read":
-            return ChatResponse(text="Okay. Choose the file you want me to read. I can only access the file you select.", intent="files", ui_action="choose_file")
+            return ChatResponse(text="Okay — choose the file you want me to read.", intent="files", ui_action="choose_file")
         if pending.capability == "gmail_read":
             self.permissions.grant(session_id, "gmail_read")
             if not self.gmail.connected():
-                return ChatResponse(text="Okay. I'll open the Google OAuth connection flow. Complete it in your browser, then ask me to check your inbox again.", intent="gmail_connect", ui_action="connect_gmail")
+                return ChatResponse(text="Okay. I’ll open the Google sign-in flow. After you connect, ask me to check your inbox again.", intent="gmail_connect", ui_action="connect_gmail")
             return await self._read_gmail("latest emails")
         if pending.capability == "gmail_send":
             try:
                 result = await self.gmail.send(**pending.payload)
-                return ChatResponse(text=f"Sent the email to {pending.payload['to']}.", intent="gmail_send", tools=[ToolResult(tool="gmail_send", data=result)])
+                return ChatResponse(text=f"Sent it to {pending.payload['to']}.", intent="gmail_send", tools=[ToolResult(tool="gmail_send", data=result)])
             except GmailConfigurationError as exc:
                 return ChatResponse(text=str(exc), intent="configuration", ui_action="connect_gmail")
         if pending.capability == "messages_send":
             result = await self.messages.send(**pending.payload)
-            return ChatResponse(text=result.get("message") or f"Sent the message to {pending.payload['recipient']}.", intent="messages_send", tools=[ToolResult(tool="macos_messages", data=result)])
+            return ChatResponse(text=result.get("message") or "Message sent.", intent="messages_send", tools=[ToolResult(tool="macos_messages", data=result)])
         return ChatResponse(text="Permission was granted, but I don't recognize that action.", intent="permission")
 
-    async def _handle_place_search(self, text: str, location: Location | None, state: dict[str, Any]) -> ChatResponse:
+    async def _handle_place_search(self, text: str, location: Location | None, state: dict[str, Any], session_id: str) -> ChatResponse:
         if not location:
-            return ChatResponse(text="I need your location first. Click Enable Location and allow access, then ask me again.", intent="location_required")
+            return ChatResponse(text="I need your location first. Click Enable Location and allow it, then ask me again.", intent="location_required")
         query = self._place_query(text)
         try:
             places = await self.places.search(query, location, 6)
-        except PlacesConfigurationError as exc:
-            return ChatResponse(text=str(exc), intent="configuration")
-        except httpx.HTTPStatusError as exc:
-            return ChatResponse(text=f"Google Places returned an error ({exc.response.status_code}). Check that Places API (New) is enabled. {exc.response.text[:240]}", intent="places_error")
+        except (PlacesConfigurationError, httpx.HTTPStatusError):
+            map_query = f"{query} near {location.latitude:.5f},{location.longitude:.5f}"
+            payload = {"label": "Google Maps", "query": map_query, "url": self.browser.google_maps(map_query)}
+            pending = self.permissions.request(session_id, "browser_open", f"Open Google Maps for {map_query}.", "browser_open", payload)
+            return ChatResponse(
+                text=f"I can’t get the rich Maps data directly without a valid Maps API key, but I can open real Google Maps at your location and search for {query}. Want me to open it?",
+                intent="permission",
+                permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Open Google Maps?", reason=pending.reason, scope="once"),
+            )
         ranked = rank_places(places)
         state["places"] = ranked
         state["selected_place"] = None
         if not ranked:
-            return ChatResponse(text=f"I couldn't find nearby results for {query}.", intent="places")
-        spoken = []
-        for i, place in enumerate(ranked[:3], start=1):
-            rating = f", rated {place['rating']}" if place.get("rating") else ""
-            spoken.append(f"{i}. {place['name']}{rating}")
-        return ChatResponse(text="Here are the best nearby options: " + "; ".join(spoken) + ". Say 'first one', the place name, or 'take me to number 1'.", intent="places", tools=[ToolResult(tool="places_search", data=ranked)])
+            return ChatResponse(text=f"I couldn't find anything useful for {query} nearby.", intent="places")
+        parts = []
+        for i, p in enumerate(ranked[:3], 1):
+            rating = f" — {p['rating']} stars" if p.get("rating") else ""
+            reviews = f" from {p['reviews']} reviews" if p.get("reviews") else ""
+            parts.append(f"{i}. {p['name']}{rating}{reviews}")
+        best = ranked[0]
+        return ChatResponse(text=f"Yeah, I found a few good options. {'; '.join(parts)}. {best['name']} looks like the strongest pick from these. Say ‘take me there’ or choose another one.", intent="places", tools=[ToolResult(tool="places_search", data=ranked)])
+
+    async def _general_answer(self, text: str, state: dict[str, Any], location: Location | None) -> ChatResponse:
+        try:
+            results = self.web.search(text, 5)
+        except Exception as exc:
+            results = []
+            search_error = str(exc)
+        else:
+            search_error = None
+
+        if results:
+            evidence = "\n".join(f"- {r['title']}: {r['snippet']} ({r['url']})" for r in results)
+            prompt = (
+                f"The user asked: {text}\n\nThese are fresh web search results:\n{evidence}\n\n"
+                "Answer like a helpful friend speaking naturally. Summarize the useful points, avoid sounding robotic, and do not invent facts not supported by the results."
+            )
+            if self.local_ai.configured():
+                answer = await self.local_ai.answer(prompt, state.get("history", []))
+            elif self.gemini.configured():
+                answer = (await self.gemini.answer(prompt, state.get("history", []), use_google_search=False))["text"]
+            else:
+                top = results[:3]
+                answer = "I checked the web. " + " ".join(f"{r['title']} says {r['snippet'][:180]}." for r in top)
+            return ChatResponse(text=answer, intent="web_search", tools=[ToolResult(tool="web_search", data=results)])
+
+        if self.local_ai.configured():
+            return ChatResponse(text=await self.local_ai.answer(text, state.get("history", [])), intent="general")
+        if self.gemini.configured():
+            try:
+                result = await self.gemini.answer(text, state.get("history", []), use_google_search=False)
+                return ChatResponse(text=result["text"], intent="general")
+            except (GeminiConfigurationError, Exception):
+                pass
+        msg = "I couldn’t reach web search just now."
+        if search_error:
+            msg += f" Search error: {search_error}"
+        msg += " You can still ask me to open Google, Maps, YouTube or Prime, or install Ollama for fully local conversation."
+        return ChatResponse(text=msg, intent="general")
 
     async def _read_gmail(self, text: str) -> ChatResponse:
         try:
@@ -168,59 +220,69 @@ class RoadMateOrchestrator:
         except GmailConfigurationError as exc:
             return ChatResponse(text=str(exc), intent="configuration", ui_action="connect_gmail")
         if not emails:
-            return ChatResponse(text="I didn't find matching emails.", intent="gmail")
-        summary = "; ".join(f"{i}. {e['subject']} from {e['from']}. {e['snippet'][:120]}" for i, e in enumerate(emails[:5], start=1))
-        return ChatResponse(text=f"Here are the recent messages: {summary}", intent="gmail", tools=[ToolResult(tool="gmail_recent", data=emails)])
+            return ChatResponse(text="I didn’t find matching emails.", intent="gmail")
+        summary = "; ".join(f"{i}. {e['subject']} from {e['from']}. {e['snippet'][:120]}" for i, e in enumerate(emails[:5], 1))
+        return ChatResponse(text=f"I checked your inbox. {summary}", intent="gmail", tools=[ToolResult(tool="gmail_recent", data=emails)])
 
     async def _answer_from_documents(self, text: str, state: dict[str, Any]) -> ChatResponse:
         if not self.rag:
             return ChatResponse(text="The document store is unavailable.", intent="documents")
         evidence = self.rag.query(text, 4)
         if not evidence:
-            return ChatResponse(text="I couldn't find that in the documents you've shared with me.", intent="documents")
+            return ChatResponse(text="I couldn’t find that in the documents you shared.", intent="documents")
         context = "\n\n".join(str(x) for x in evidence)
+        prompt = f"Answer only from this document evidence. Question: {text}\nEvidence:\n{context}"
+        if self.local_ai.configured():
+            answer = await self.local_ai.answer(prompt, [])
+            return ChatResponse(text=answer, intent="documents", tools=[ToolResult(tool="rag", data=evidence)])
         if self.gemini.configured():
-            answer = await self.gemini.answer(f"Answer this question only from the supplied document evidence. Question: {text}\nEvidence:\n{context}", history=[], use_google_search=False)
+            answer = await self.gemini.answer(prompt, history=[], use_google_search=False)
             return ChatResponse(text=answer["text"], intent="documents", tools=[ToolResult(tool="rag", data=evidence)])
-        return ChatResponse(text=f"I found this in your document: {context[:1200]}", intent="documents", tools=[ToolResult(tool="rag", data=evidence)])
+        return ChatResponse(text=f"Here’s what I found in your document: {context[:1200]}", intent="documents", tools=[ToolResult(tool="rag", data=evidence)])
 
-    async def _general_answer(self, text: str, state: dict[str, Any], location: Location | None) -> ChatResponse:
-        if not self.gemini.configured():
-            return ChatResponse(text="I can handle Maps, routes, documents, Gmail, Spotify, and permissions now. Add GEMINI_API_KEY to .env to let me answer open-ended questions using Gemini and current Google Search.", intent="general")
-        location_context = f"{location.latitude:.5f}, {location.longitude:.5f}" if location else None
-        try:
-            result = await self.gemini.answer(text, state.get("history", []), location_context, use_google_search=True)
-            return ChatResponse(text=result["text"], intent="general", tools=[ToolResult(tool="google_grounded_gemini", data={"sources": result.get("sources", [])})])
-        except GeminiConfigurationError as exc:
-            return ChatResponse(text=str(exc), intent="configuration")
-        except Exception as exc:
-            return ChatResponse(text=f"Gemini request failed: {exc}", intent="ai_error")
+    async def _route_to_place(self, place: dict, location: Location | None) -> ChatResponse:
+        if not location:
+            return ChatResponse(text="I need your current location first.", intent="location_required")
+        loc = place.get("location") or {}
+        if loc.get("latitude") is None or loc.get("longitude") is None:
+            return ChatResponse(text=f"I don’t have coordinates for {place.get('name', 'that place')}.", intent="route_error")
+        destination = Location(latitude=loc["latitude"], longitude=loc["longitude"])
+        route = await self.routes.route(location, destination, "DRIVE")
+        if route.get("mode") != "live":
+            map_query = place.get("address") or place.get("name")
+            return ChatResponse(text=f"I can’t calculate the traffic ETA directly right now, but I can open Google Maps for {place['name']}.", intent="route", ui_action="open_url", ui_data={"url": self.browser.google_maps(map_query), "label": "Google Maps"})
+        routes = route.get("routes", [])
+        if not routes:
+            return ChatResponse(text=f"I couldn’t calculate a route to {place['name']}.", intent="route_error")
+        best = routes[0]
+        meters = best.get("distanceMeters")
+        duration = best.get("duration") or "unknown time"
+        miles = round(meters / 1609.344, 1) if meters else None
+        distance_text = f"{miles} miles" if miles is not None else "an unknown distance"
+        return ChatResponse(text=f"Okay — {place['name']} is about {distance_text} away and the current driving estimate is {duration}. That ETA includes traffic.", intent="route", tools=[ToolResult(tool="route", data={"place": place, **route})])
+
+    def _parse_browser_request(self, text: str) -> dict[str, str] | None:
+        lower = text.lower().strip()
+        patterns = [
+            (r"(?:search|google)\s+(?:for\s+)?(.+?)(?:\s+on google)?$", "Google", self.browser.google_search),
+            (r"(?:open|search)\s+(?:google maps|maps)\s+(?:for\s+)?(.+)$", "Google Maps", self.browser.google_maps),
+            (r"(?:play|search|open)\s+(.+?)\s+(?:on\s+)?youtube$", "YouTube", self.browser.youtube_search),
+            (r"(?:youtube)\s+(.+)$", "YouTube", self.browser.youtube_search),
+            (r"(?:play|search|open)\s+(.+?)\s+(?:on\s+)?(?:prime|prime video|amazon prime)$", "Prime Video", self.browser.prime_search),
+            (r"(?:prime|prime video)\s+(.+)$", "Prime Video", self.browser.prime_search),
+        ]
+        for pattern, label, builder in patterns:
+            match = re.search(pattern, lower, re.I)
+            if match:
+                query = match.group(1).strip()
+                return {"label": label, "query": query, "url": builder(query)}
+        return None
 
     def _remember(self, state: dict[str, Any], user_text: str, response: ChatResponse) -> ChatResponse:
         state["history"].append({"role": "user", "text": user_text})
         state["history"].append({"role": "assistant", "text": response.text})
         state["history"] = state["history"][-16:]
         return response
-
-    async def _route_to_place(self, place: dict, location: Location | None) -> ChatResponse:
-        if not location:
-            return ChatResponse(text="I need your current location before I can calculate the route.", intent="location_required")
-        loc = place.get("location") or {}
-        if loc.get("latitude") is None or loc.get("longitude") is None:
-            return ChatResponse(text=f"I don't have coordinates for {place.get('name', 'that place')}.", intent="route_error")
-        destination = Location(latitude=loc["latitude"], longitude=loc["longitude"])
-        route = await self.routes.route(location, destination, "DRIVE")
-        if route.get("mode") != "live":
-            return ChatResponse(text=route.get("message", "Live routing is not configured."), intent="configuration")
-        routes = route.get("routes", [])
-        if not routes:
-            return ChatResponse(text=f"I couldn't calculate a route to {place['name']}.", intent="route_error")
-        best = routes[0]
-        meters = best.get("distanceMeters")
-        duration = best.get("duration") or "unknown time"
-        miles = round(meters / 1609.344, 1) if meters else None
-        distance_text = f"{miles} miles" if miles is not None else "an unknown distance"
-        return ChatResponse(text=f"Routing to {place['name']}. The best current route is about {distance_text} and {duration}. Live traffic is included in the driving ETA.", intent="route", tools=[ToolResult(tool="route", data={"place": place, **route})])
 
     def _looks_like_file_request(self, lower: str) -> bool:
         return any(k in lower for k in ["my file", "my document", "my pdf", "my resume", "open a file", "read a file", "read document", "open document", "choose a file"])
@@ -233,15 +295,11 @@ class RoadMateOrchestrator:
 
     def _parse_email_send(self, text: str) -> dict[str, str] | None:
         match = re.search(r"(?:send|email)\s+(?:an?\s+email\s+)?to\s+([\w.+-]+@[\w.-]+)\s+(?:saying|that says|message)?\s*[:,-]?\s*(.+)", text, re.I)
-        if not match:
-            return None
-        return {"to": match.group(1), "subject": "Message from Road Friend", "body": match.group(2).strip()}
+        return {"to": match.group(1), "subject": "Message from Road Friend", "body": match.group(2).strip()} if match else None
 
     def _parse_text_send(self, text: str) -> dict[str, str] | None:
         match = re.search(r"(?:text|message)\s+([+\w@.()-]+)\s+(?:saying|that says)?\s*[:,-]?\s*(.+)", text, re.I)
-        if not match:
-            return None
-        return {"recipient": match.group(1), "body": match.group(2).strip()}
+        return {"recipient": match.group(1), "body": match.group(2).strip()} if match else None
 
     def _is_place_search(self, lower: str) -> bool:
         return any(k in lower for k in ["near me", "nearby", "restaurant", "waterfall", "coffee", "food", "gas station", "park", "hiking", "cafe", "breakfast", "lunch", "dinner"])
@@ -255,7 +313,7 @@ class RoadMateOrchestrator:
         lower = text.lower().strip()
         ordinal_patterns = {0: ["first", "first one", "number 1", "#1", "option 1"], 1: ["second", "second one", "number 2", "#2", "option 2"], 2: ["third", "third one", "number 3", "#3", "option 3"]}
         for idx, patterns in ordinal_patterns.items():
-            if idx < len(places) and any(pattern in lower for pattern in patterns):
+            if idx < len(places) and any(p in lower for p in patterns):
                 return places[idx]
         for place in places:
             name = (place.get("name") or "").lower()
