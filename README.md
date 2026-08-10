@@ -1,6 +1,6 @@
 # Road Friend — Personal AI Companion
 
-Road Friend is a local-first voice + text personal companion for your Mac. It can search the public web, summarize results conversationally, use your live location, open Google/Google Maps/YouTube/Prime Video with permission, read files you explicitly choose, connect to Gmail, and use optional local AI through Ollama.
+Road Friend is a local-first voice + text personal companion for your Mac. It can search the public web, summarize results conversationally, use your live location, research nearby places in the background, open Google/Google Maps/YouTube/Prime Video with permission, read files you explicitly choose, connect to Gmail, and use optional local AI through Ollama.
 
 ## How it behaves
 
@@ -11,18 +11,28 @@ You: What's happening with Nvidia today?
 Road Friend: I checked the web. The main things I'm seeing are ...
 
 You: Find coffee near me.
-Road Friend: [uses structured Google Places if configured; otherwise asks to open Google Maps at your location]
+Road Friend: I checked nearby places in the background. Here are four real options, including distance and any rating I could verify. Which one do you want?
+
+You: Take me to the second one.
+Road Friend: That one is about ... miles away. Want me to open Google Maps directions?
 
 You: Play Interstellar trailer on YouTube.
 Road Friend: I can open YouTube and search for that. Want me to open it?
 You: Yes.
 Road Friend: Opening YouTube.
-
-You: Find The Boys on Prime.
-Road Friend: Want me to open Prime Video and search for it?
 ```
 
 External browser actions require approval. Private data access requires permission. Sending email or Messages requires a separate confirmation.
+
+## Nearby-place background research
+
+Road Friend no longer has to open Google Maps just to discover nearby places.
+
+When a Google Maps Platform key is not configured, it can use OpenStreetMap/Overpass in the background to discover real nearby cafes, restaurants, fuel stations, parks, waterfalls and trails. It calculates straight-line distance from your current coordinates and can optionally enrich a place with a rating only when a public web snippet clearly exposes one.
+
+It does **not** invent ratings. If a rating cannot be verified, Road Friend says so and uses distance as the more reliable comparison.
+
+With an official Google Maps API key configured, it can additionally use structured Google Places data and traffic-aware Routes data.
 
 ## No Google Cloud required for normal questions
 
@@ -61,7 +71,7 @@ Gemini is optional.
 
 Two modes are supported:
 
-1. **No Maps API key:** Road Friend asks permission and opens real Google Maps in your browser using your query/location.
+1. **No Maps API key:** Road Friend researches nearby places in the background using key-free sources, tells you the choices and distances, then asks before opening Google Maps directions.
 2. **Maps API key configured:** Road Friend can directly read structured place names, ratings, review counts, coordinates, routes and traffic-aware ETAs.
 
 Optional:
@@ -139,6 +149,7 @@ ALLOW_MACOS_MESSAGES=false
 | Capability | Rule |
 |---|---|
 | Public web search | Allowed |
+| Background nearby-place research | Allowed after location permission |
 | Open Google/Maps/YouTube/Prime | Ask before opening |
 | Location | Browser permission |
 | Local files | Ask + user file picker |
@@ -150,4 +161,4 @@ ALLOW_MACOS_MESSAGES=false
 
 ## Important limits
 
-Road Friend can open YouTube or Prime Video searches in your browser, but it does not bypass account authentication or streaming protections. Directly scraping Google Search/Google Maps pages in the background is intentionally avoided because it is brittle; structured Maps details require the official Maps API, while normal web answers use the independent key-free search backend.
+Road Friend can open YouTube or Prime Video searches in your browser, but it does not bypass account authentication or streaming protections. Without the official Google Maps APIs, nearby distances are straight-line estimates and live traffic ETA is not available. Directly scraping Google Search/Google Maps pages in the background is intentionally avoided because it is brittle; structured Google ratings/routes require the official Maps APIs, while key-free nearby discovery uses OpenStreetMap/Overpass and normal web answers use the independent search backend.
