@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -11,6 +12,7 @@ from app.integrations.gemini import GeminiConfigurationError, GeminiFriend
 from app.integrations.gmail import GmailClient, GmailConfigurationError
 from app.integrations.local_ai import LocalAI
 from app.integrations.macos_messages import MacMessagesClient
+from app.integrations.nearby_search import NearbySearchClient
 from app.integrations.places import PlacesClient, PlacesConfigurationError
 from app.integrations.routes import RoutesClient
 from app.integrations.spotify import SpotifyClient
@@ -24,10 +26,11 @@ NO = {"no", "nope", "deny", "cancel", "don't", "do not"}
 
 
 class RoadMateOrchestrator:
-    """Personal companion orchestrator with search, browser actions, memory and permissions."""
+    """Personal companion orchestrator with background research, memory and permissioned actions."""
 
     def __init__(self, rag=None) -> None:
         self.places = PlacesClient()
+        self.nearby = NearbySearchClient()
         self.routes = RoutesClient()
         self.spotify = SpotifyClient()
         self.gmail = GmailClient()
@@ -82,9 +85,9 @@ class RoadMateOrchestrator:
             state["selected_place"] = selected
             if not route_requested:
                 return self._remember(state, text, ChatResponse(text=f"Got it — {selected['name']}. Say ‘take me there’ and I’ll work out the route.", intent="place_selection", tools=[ToolResult(tool="selected_place", data=selected)]))
-            return self._remember(state, text, await self._route_to_place(selected, location))
+            return self._remember(state, text, await self._route_to_place(selected, location, req.session_id))
         if route_requested and state.get("selected_place"):
-            return self._remember(state, text, await self._route_to_place(state["selected_place"], location))
+            return self._remember(state, text, await self._route_to_place(state["selected_place"], location, req.session_id))
 
         if self._is_place_search(lower):
             return self._remember(state, text, await self._handle_place_search(text, location, state, req.session_id))
@@ -148,29 +151,42 @@ class RoadMateOrchestrator:
         if not location:
             return ChatResponse(text="I need your location first. Click Enable Location and allow it, then ask me again.", intent="location_required")
         query = self._place_query(text)
+        source = "Google Places"
         try:
-            places = await self.places.search(query, location, 6)
+            places = await self.places.search(query, location, 8)
+            ranked = rank_places(places)
         except (PlacesConfigurationError, httpx.HTTPStatusError):
-            map_query = f"{query} near {location.latitude:.5f},{location.longitude:.5f}"
-            payload = {"label": "Google Maps", "query": map_query, "url": self.browser.google_maps(map_query)}
-            pending = self.permissions.request(session_id, "browser_open", f"Open Google Maps for {map_query}.", "browser_open", payload)
-            return ChatResponse(
-                text=f"I can’t get the rich Maps data directly without a valid Maps API key, but I can open real Google Maps at your location and search for {query}. Want me to open it?",
-                intent="permission",
-                permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title="Open Google Maps?", reason=pending.reason, scope="once"),
-            )
-        ranked = rank_places(places)
+            source = "OpenStreetMap + public web"
+            try:
+                ranked = await self.nearby.search(query, location, 8)
+            except Exception as exc:
+                return ChatResponse(text=f"I couldn't finish the nearby search in the background just now: {exc}. You can try again in a moment.", intent="places_error")
+
         state["places"] = ranked
         state["selected_place"] = None
         if not ranked:
             return ChatResponse(text=f"I couldn't find anything useful for {query} nearby.", intent="places")
-        parts = []
-        for i, p in enumerate(ranked[:3], 1):
-            rating = f" — {p['rating']} stars" if p.get("rating") else ""
-            reviews = f" from {p['reviews']} reviews" if p.get("reviews") else ""
-            parts.append(f"{i}. {p['name']}{rating}{reviews}")
-        best = ranked[0]
-        return ChatResponse(text=f"Yeah, I found a few good options. {'; '.join(parts)}. {best['name']} looks like the strongest pick from these. Say ‘take me there’ or choose another one.", intent="places", tools=[ToolResult(tool="places_search", data=ranked)])
+
+        top = ranked[:4]
+        parts: list[str] = []
+        for i, p in enumerate(top, 1):
+            distance = p.get("distance_miles")
+            distance_text = f", about {distance:.1f} miles away" if isinstance(distance, (int, float)) else ""
+            rating = p.get("rating")
+            rating_text = f", rated {rating} out of 5" if rating else ", rating not verified"
+            parts.append(f"{i}. {p['name']}{rating_text}{distance_text}")
+
+        verified_ratings = any(p.get("rating") for p in top)
+        if verified_ratings:
+            intro = "I checked nearby places in the background and found four good options."
+        else:
+            intro = "I checked nearby places in the background and found four real options. I couldn't verify ratings for all of them, so the distance information is the more reliable comparison."
+        nearest = min(top, key=lambda p: p.get("distance_miles", 10**9))
+        tail = f"The closest one I found is {nearest['name']}"
+        if nearest.get("distance_miles") is not None:
+            tail += f", about {nearest['distance_miles']:.1f} miles away"
+        tail += ". Which one do you want to go to? You can say first, second, third, fourth, or the place name."
+        return ChatResponse(text=f"{intro} {'; '.join(parts)}. {tail}", intent="places", tools=[ToolResult(tool="places_search", data={"source": source, "places": ranked})])
 
     async def _general_answer(self, text: str, state: dict[str, Any], location: Location | None) -> ChatResponse:
         try:
@@ -240,7 +256,7 @@ class RoadMateOrchestrator:
             return ChatResponse(text=answer["text"], intent="documents", tools=[ToolResult(tool="rag", data=evidence)])
         return ChatResponse(text=f"Here’s what I found in your document: {context[:1200]}", intent="documents", tools=[ToolResult(tool="rag", data=evidence)])
 
-    async def _route_to_place(self, place: dict, location: Location | None) -> ChatResponse:
+    async def _route_to_place(self, place: dict, location: Location | None, session_id: str) -> ChatResponse:
         if not location:
             return ChatResponse(text="I need your current location first.", intent="location_required")
         loc = place.get("location") or {}
@@ -249,8 +265,21 @@ class RoadMateOrchestrator:
         destination = Location(latitude=loc["latitude"], longitude=loc["longitude"])
         route = await self.routes.route(location, destination, "DRIVE")
         if route.get("mode") != "live":
-            map_query = place.get("address") or place.get("name")
-            return ChatResponse(text=f"I can’t calculate the traffic ETA directly right now, but I can open Google Maps for {place['name']}.", intent="route", ui_action="open_url", ui_data={"url": self.browser.google_maps(map_query), "label": "Google Maps"})
+            straight = place.get("distance_miles")
+            distance_text = f" about {straight:.1f} miles away in a straight line" if isinstance(straight, (int, float)) else " nearby"
+            params = urlencode({
+                "api": 1,
+                "origin": f"{location.latitude},{location.longitude}",
+                "destination": f"{destination.latitude},{destination.longitude}",
+                "travelmode": "driving",
+            })
+            payload = {"label": "Google Maps directions", "query": place["name"], "url": f"https://www.google.com/maps/dir/?{params}"}
+            pending = self.permissions.request(session_id, "browser_open", f"Open driving directions to {place['name']} in Google Maps.", "browser_open", payload)
+            return ChatResponse(
+                text=f"{place['name']} is{distance_text}. I don't have a verified live traffic ETA without the Routes API. Want me to open Google Maps directions to it?",
+                intent="permission",
+                permission_request=PermissionRequest(id=pending.id, capability=pending.capability, title=f"Navigate to {place['name']}?", reason=pending.reason, scope="once"),
+            )
         routes = route.get("routes", [])
         if not routes:
             return ChatResponse(text=f"I couldn’t calculate a route to {place['name']}.", intent="route_error")
@@ -302,16 +331,21 @@ class RoadMateOrchestrator:
         return {"recipient": match.group(1), "body": match.group(2).strip()} if match else None
 
     def _is_place_search(self, lower: str) -> bool:
-        return any(k in lower for k in ["near me", "nearby", "restaurant", "waterfall", "coffee", "food", "gas station", "park", "hiking", "cafe", "breakfast", "lunch", "dinner"])
+        return any(k in lower for k in ["near me", "nearby", "restaurant", "waterfall", "coffee", "food", "gas station", "park", "hiking", "cafe", "breakfast", "lunch", "dinner", "nearest", "closest"])
 
     def _looks_like_selection(self, lower: str) -> bool:
-        return lower in {"first", "first one", "second", "second one", "third", "third one", "number 1", "number 2", "number 3"}
+        return lower in {"first", "first one", "second", "second one", "third", "third one", "fourth", "fourth one", "number 1", "number 2", "number 3", "number 4"}
 
     def _resolve_place_reference(self, text: str, places: list[dict]) -> dict | None:
         if not places:
             return None
         lower = text.lower().strip()
-        ordinal_patterns = {0: ["first", "first one", "number 1", "#1", "option 1"], 1: ["second", "second one", "number 2", "#2", "option 2"], 2: ["third", "third one", "number 3", "#3", "option 3"]}
+        ordinal_patterns = {
+            0: ["first", "first one", "number 1", "#1", "option 1"],
+            1: ["second", "second one", "number 2", "#2", "option 2"],
+            2: ["third", "third one", "number 3", "#3", "option 3"],
+            3: ["fourth", "fourth one", "number 4", "#4", "option 4"],
+        }
         for idx, patterns in ordinal_patterns.items():
             if idx < len(places) and any(p in lower for p in patterns):
                 return places[idx]
